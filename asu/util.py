@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import struct
+from os import getuid, getgid
 from pathlib import Path
 from re import match
 from tarfile import TarFile
@@ -119,7 +120,7 @@ def get_request_hash(build_request: BuildRequest) -> str:
     Creates a reproducible hash of the request by sorting the arguments
 
     Args:
-        req (dict): dict contianing request information
+        req (dict): dict containing request information
 
     Returns:
         str: hash of `req`
@@ -185,7 +186,7 @@ def verify_usign(sig_file: Path, msg_file: Path, pub_key: str) -> bool:
         pub_key (str): public key to use for verification
 
     Returns:
-        bool: Sucessfull verification
+        bool: Successful verification
 
     Todo:
          Currently ignores keynum and pkalg
@@ -270,10 +271,13 @@ def run_cmd(
             host_tar.write(data)
         host_tar.flush()
 
-        tar_file = TarFile(host_tar.name)
-        tar_file.extractall(copy[1])
-
-        host_tar.close()
+        with TarFile(host_tar.name) as tar_file:
+            for member in tar_file:
+                # Fix the owner of the copied files, change to "us".
+                member.uid = getuid()
+                member.gid = getgid()
+                member.mode = 0o755 if member.isdir() else 0o644
+            tar_file.extractall(copy[1])
         logging.debug(f"Closed {host_tar}")
 
     return returncode, stdout, stderr
@@ -320,38 +324,32 @@ def check_manifest(
             )
 
 
-def parse_packages_versions(text: str) -> dict:
+def parse_packages_file(url: str) -> dict[str, str]:
+    res = httpx.get(f"{url}/Packages")
+    if res.status_code != 200:
+        return {}
+
     index = {}
-    architecure = ""
+    architecture = ""
     parser = email.parser.Parser()
-    chunks = text.strip().split("\n\n")
+    chunks = res.text.strip().split("\n\n")
     for chunk in chunks:
         package = parser.parsestr(chunk, headersonly=True)
-        if not architecure:
-            architecure = package["Architecture"]
+        if not architecture:
+            architecture = package["Architecture"]
         package_name = package["Package"]
         if package_abi := package.get("ABIVersion"):
             package_name = package_name.removesuffix(package_abi)
 
         index[package_name] = package["Version"]
 
-    return {"architecture": architecure, "packages": index}
-
-
-def parse_packages_file(url: str) -> dict[str, str]:
-    res = httpx.get(url + "/Packages")
-    return parse_packages_versions(res.text) if res.status_code == 200 else {}
+    return {"architecture": architecture, "packages": index}
 
 
 def parse_feeds_conf(url: str) -> list[str]:
-    req = httpx.get(url + "/feeds.conf")
-
-    feeds: list[str] = []
-
-    if req.status_code != 200:
-        return feeds
-
-    for line in req.text.splitlines():
-        feeds.append(line.split(" ")[1])
-
-    return feeds
+    res = httpx.get(f"{url}/feeds.conf")
+    return (
+        [line.split()[1] for line in res.text.splitlines()]
+        if res.status_code == 200
+        else []
+    )
